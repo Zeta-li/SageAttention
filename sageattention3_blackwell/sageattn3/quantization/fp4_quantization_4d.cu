@@ -130,13 +130,39 @@ struct PackedVec {
   typename TypeConverter<Type>::Type elts[8];
 };
 
+// Load a 16-element vector from global memory with bounds checking on the
+// feature dimension. Elements past input_d are zero-filled so that a tensor
+// with head dim e.g. 120 can be quantized directly into a padded head_dim=128
+// output layout without a separate F.pad pass over the whole tensor.
+template <typename T, typename PackedVec>
+inline __device__ void load_packed_vec_predicated(
+    const T* base, int feat_off, int input_d, PackedVec& in_vec) {
+  using Vec2 = typename TypeConverter<T>::Type;
+  #pragma unroll
+  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
+  }
+  if (feat_off + CVT_FP4_ELTS_PER_THREAD <= input_d) {
+    in_vec = reinterpret_cast<PackedVec const*>(base + feat_off)[0];
+  } else if (feat_off < input_d) {
+    // Tail group: element-wise predicated load (only hit by the last group).
+    #pragma unroll
+    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+      T lo = (feat_off + 2 * i < input_d) ? base[feat_off + 2 * i] : T(0.0f);
+      T hi = (feat_off + 2 * i + 1 < input_d) ? base[feat_off + 2 * i + 1] : T(0.0f);
+      in_vec.elts[i] = Vec2{lo, hi};
+    }
+  }
+}
+
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, bool permute, typename T>
 __global__ void scaled_fp4_quant_kernel(
     const T* input, uint8_t* output, uint8_t* output_sf,
     int batch_size, int num_heads, int num_tokens,
     int stride_bz_input, int stride_h_input, int stride_seq_input,
     int stride_bz_output, int stride_h_output, int stride_seq_output,
-    int stride_bz_output_sf, int stride_h_output_sf, int stride_seq_output_sf) {
+    int stride_bz_output_sf, int stride_h_output_sf, int stride_seq_output_sf,
+    int input_d = head_dim) {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 input are supported");
   using PackedVec = PackedVec<T>;
 
@@ -168,19 +194,20 @@ __global__ void scaled_fp4_quant_kernel(
   }
 
   PackedVec in_vec;
-  
-  #pragma unroll
-  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
-  }
-  
-  if (load_token_id < num_tokens) {
-    in_vec = reinterpret_cast<PackedVec const*>(input + 
-                                          batch_id * stride_bz_input + // batch dim
-                                          head_id * stride_h_input +   // head dim
-                                          load_token_id * stride_seq_input + // seq dim
-                                          (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD)[0]; // feature dim
-  }
+
+#pragma unroll
+for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+  reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
+}
+
+if (load_token_id < num_tokens) {
+  load_packed_vec_predicated<T, PackedVec>(input +
+                                        batch_id * stride_bz_input + // batch dim
+                                        head_id * stride_h_input +   // head dim
+                                        load_token_id * stride_seq_input, // seq dim
+                                        (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD, // feature dim
+                                        input_d, in_vec);
+}
 
   // calculate max of every consecutive 16 elements
   auto localMax = __habs2(in_vec.elts[0]);
@@ -263,7 +290,8 @@ __global__ void scaled_fp4_quant_trans_kernel(
     int batch_size, int num_heads, int num_tokens,
     int stride_bz_input, int stride_h_input, int stride_seq_input,
     int stride_bz_output, int stride_h_output, int stride_d_output,
-    int stride_bz_output_sf, int stride_h_output_sf, int stride_d_output_sf) {
+    int stride_bz_output_sf, int stride_h_output_sf, int stride_d_output_sf,
+    int input_d = head_dim) {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 input are supported");
   using PackedVec = PackedVec<T>;
 
@@ -290,11 +318,12 @@ __global__ void scaled_fp4_quant_trans_kernel(
   }
   
   if (token_id < num_tokens) {
-    in_vec = reinterpret_cast<PackedVec const*>(input + 
+    load_packed_vec_predicated<T, PackedVec>(input +
                                           batch_id * stride_bz_input + // batch dim
                                           head_id * stride_h_input +   // head dim
-                                          token_id * stride_seq_input + // seq dim
-                                          (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD)[0]; // feature dim
+                                          token_id * stride_seq_input, // seq dim
+                                          (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD, // feature dim
+                                          input_d, in_vec);
   }
 
   // transpose
@@ -407,7 +436,13 @@ void scaled_fp4_quant(torch::Tensor const& input,
   CHECK_DIMS(output_sf, 4);
 
   const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
+  // Real (possibly unpadded) head dim of the input, e.g. 120.
+  const int input_d = int(input.size(3));
+  // Padded head dim of the output layout, derived from the output tensor so
+  // that a 120-wide input can be quantized directly into a 128-wide layout
+  // (zero-filled tail) without a separate host-side F.pad pass.
+  const int head_dim = int(output.size(3)) * 2;
+  TORCH_CHECK(input_d <= head_dim, "input head dim must not exceed padded output head dim");
 
   const int stride_bz_input = input.stride(0);
   const int stride_bz_output = output.stride(0);
@@ -426,8 +461,8 @@ void scaled_fp4_quant(torch::Tensor const& input,
     stride_h_output = output.stride(2);
     stride_h_output_sf = output_sf.stride(2);
 
-    CHECK_SHAPE(output, batch_size, num_tokens, num_heads, head_dim / 2);
-    CHECK_SHAPE(output_sf, batch_size, num_tokens, num_heads, head_dim / 16);
+    CHECK_SHAPE(output, batch_size, ((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE, num_heads, head_dim / 2);
+    CHECK_SHAPE(output_sf, batch_size, ((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE, num_heads, head_dim / 16);
   } else {
     num_tokens = input.size(2);
     num_heads = input.size(1);
@@ -438,8 +473,8 @@ void scaled_fp4_quant(torch::Tensor const& input,
     stride_h_output = output.stride(1);
     stride_h_output_sf = output_sf.stride(1);
 
-    CHECK_SHAPE(output, batch_size, num_heads, num_tokens, head_dim / 2);
-    CHECK_SHAPE(output_sf, batch_size, num_heads, num_tokens, head_dim / 16);
+    CHECK_SHAPE(output, batch_size, num_heads, ((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE, head_dim / 2);
+    CHECK_SHAPE(output_sf, batch_size, num_heads, ((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE, head_dim / 16);
   }
 
   auto input_dtype = input.scalar_type();
@@ -458,7 +493,8 @@ void scaled_fp4_quant(torch::Tensor const& input,
               batch_size, num_heads, num_tokens,
               stride_bz_input, stride_h_input, stride_seq_input,
               stride_bz_output, stride_h_output, stride_seq_output,
-              stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf);
+              stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf,
+              input_d);
     });
   });
 }
@@ -485,7 +521,9 @@ void scaled_fp4_quant_permute(torch::Tensor const& input,
   CHECK_DIMS(output_sf, 4);
 
   const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
+  const int input_d = int(input.size(3));
+  const int head_dim = int(output.size(3)) * 2;
+  TORCH_CHECK(input_d <= head_dim, "input head dim must not exceed padded output head dim");
 
   const int stride_bz_input = input.stride(0);
   const int stride_bz_output = output.stride(0);
@@ -537,7 +575,8 @@ void scaled_fp4_quant_permute(torch::Tensor const& input,
               batch_size, num_heads, num_tokens,
               stride_bz_input, stride_h_input, stride_seq_input,
               stride_bz_output, stride_h_output, stride_seq_output,
-              stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf);
+              stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf,
+              input_d);
     });
   });
 }
@@ -564,7 +603,11 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
   CHECK_DIMS(output_sf, 4);
 
   const int batch_size = input.size(0);
-  const int head_dim = input.size(3);
+  const int input_d = int(input.size(3));
+  // Transposed output layout is [B, D, H, L/2] (layout 0) or [B, H, D, L/2]
+  // (layout 1), so the padded head dim lives on dim 1 or dim 2.
+  const int head_dim = int(output.size(tensor_layout == 0 ? 1 : 2));
+  TORCH_CHECK(input_d <= head_dim, "input head dim must not exceed padded output head dim");
 
   const int stride_bz_input = input.stride(0);
   const int stride_bz_output = output.stride(0);
@@ -616,7 +659,8 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
               batch_size, num_heads, num_tokens,
               stride_bz_input, stride_h_input, stride_seq_input,
               stride_bz_output, stride_h_output, stride_d_output,
-              stride_bz_output_sf, stride_h_output_sf, stride_d_output_sf);
+              stride_bz_output_sf, stride_h_output_sf, stride_d_output_sf,
+              input_d);
     });
   });
 }

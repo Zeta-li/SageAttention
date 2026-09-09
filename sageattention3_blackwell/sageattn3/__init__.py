@@ -13,4 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-from .api import sageattn3_blackwell
+from .api import (
+    sageattn3_blackwell,
+    supports_current_device,
+    SGLANG_NATIVE_GQA,
+    SGLANG_DYNAMIC_SM_SCHEDULER,
+)

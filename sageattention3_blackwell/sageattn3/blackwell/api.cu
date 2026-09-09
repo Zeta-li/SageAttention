@@ -211,15 +211,17 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
         int unpadded_k,
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
-        bool is_causal, 
+        bool is_causal,
         bool per_block_mean,
-        bool is_bf16
+        bool is_bf16,
+        int num_sms
     ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
+    bool is_sm100 = dprops->major == 10 && dprops->minor == 0;
     bool is_sm120 = dprops->major == 12 && dprops->minor == 0;
     bool is_sm121 = dprops->major == 12 && dprops->minor == 1;
-    TORCH_CHECK(is_sm120 || is_sm121, "only supports Blackwell GPUs or newer.");
+    TORCH_CHECK(is_sm100 || is_sm120 || is_sm121, "only supports Blackwell GPUs or newer.");
 
     auto q_dtype = q.dtype();
     auto sfq_dtype = sfq.dtype();
@@ -255,7 +257,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(unpacked_head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(num_heads == num_heads_k, "We do not support MQA/GQA yet");
+    // Native MQA/GQA support: K/V (and their scale factors) are indexed with
+    // bidh / h_h_k_ratio inside the mainloop, so no K/V expansion is needed.
 
     TORCH_CHECK(unpacked_head_size == 64 || unpacked_head_size == 128 || unpacked_head_size == 256, "Only support head size 64, 128, and 256 for now");
 
@@ -310,6 +313,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     // TODO: 132 sm count?
     auto tile_count_semaphore = is_causal ? torch::full({1}, 132, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+    // num_sms <= 0 means "auto": size the persistent grid to the actual device
+    // instead of the hard-coded 170 (GB200). This matters on sm_120 (110 SMs).
+    params.num_sms = num_sms > 0 ? num_sms : int(dprops->multiProcessorCount);
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -337,5 +343,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
-    m.def("fwd", &mha_fwd, "Forward pass");
+    m.def("fwd", &mha_fwd, "Forward pass",
+          py::arg("q"), py::arg("k"), py::arg("v"),
+          py::arg("sfq"), py::arg("sfk"), py::arg("sfv"),
+          py::arg("delta_s"), py::arg("unpadded_k"), py::arg("out_"),
+          py::arg("softmax_scale"), py::arg("is_causal"),
+          py::arg("per_block_mean"), py::arg("is_bf16"),
+          py::arg("num_sms") = 170);
 }

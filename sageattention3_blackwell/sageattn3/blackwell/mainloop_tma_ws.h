@@ -174,6 +174,8 @@ struct CollectiveMainloopFwd {
         ShapeQKV const shape_ds;
         StrideQKV const stride_ds;
         float const softmax_scale_log2;
+        // For MQA/GQA: number of query heads per KV head (h / h_k). 1 = MHA.
+        int32_t const h_h_k_ratio = 1;
     };
 
     // Device side kernel params
@@ -194,6 +196,7 @@ struct CollectiveMainloopFwd {
         TMA_SFVt tma_load_SFVt;
         TMA_DS tma_load_DS;
         float const softmax_scale_log2;
+        int32_t const h_h_k_ratio;
     };
 
 
@@ -260,8 +263,9 @@ struct CollectiveMainloopFwd {
                 tma_load_Q, tma_load_sfq,
                 tma_load_K, tma_load_sfk,
                 tma_load_Vt, tma_load_sfvt,
-                tma_load_ds, 
-                args.softmax_scale_log2};
+                tma_load_ds,
+                args.softmax_scale_log2,
+                args.h_h_k_ratio};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -449,6 +453,10 @@ struct CollectiveMainloopFwd {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         auto [m_block, bidh, bidb] = work_tile_info.get_block_coord(scheduler_params);
+        // For MQA/GQA, K/V (and their scale factors) are shared by a group of
+        // query heads: index them with the KV-head id instead of the Q-head id.
+        // Q, delta_s and SFQ stay per-Q-head (bidh).
+        int const bidh_kv = bidh / mainloop_params.h_h_k_ratio;
 
         int n_block_max = get_n_block_max(mainloop_params, m_block);
 
@@ -471,8 +479,8 @@ struct CollectiveMainloopFwd {
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
         Tensor gQ = local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
-        Tensor gK = local_tile(mK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gVt = local_tile(mVt(_, _, bidh, bidb), make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _));  // (N, K, _)
+        Tensor gK = local_tile(mK(_, _, bidh_kv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gVt = local_tile(mVt(_, _, bidh_kv, bidb), make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _));  // (N, K, _)
         Tensor gDS = [&] {
                         if constexpr (BlockMean) {
                             return local_tile(mDS(_, _, bidh, bidb), select<0, 1>(TileShape_MNK{}), make_coord(m_block, _));
@@ -481,8 +489,8 @@ struct CollectiveMainloopFwd {
                         }
                     }();
         Tensor gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
-        Tensor gSFK = local_tile(mSFK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-        Tensor gSFVt = local_tile(mSFVt(_, _, bidh, bidb), make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _));
+        Tensor gSFK = local_tile(mSFK(_, _, bidh_kv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+        Tensor gSFVt = local_tile(mSFVt(_, _, bidh_kv, bidb), make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _));
         auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = block_tma_q.partition_S(gQ);
         Tensor tQsQ = block_tma_q.partition_D(sQ);

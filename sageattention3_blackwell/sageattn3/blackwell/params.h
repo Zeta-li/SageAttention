@@ -173,6 +173,10 @@ struct Flash_fwd_params : public Qkv_params {
     index_t alibi_slopes_batch_stride;
 
     int * __restrict__ tile_count_semaphore;
+
+    // Number of SMs used to size the persistent-CTA grid. Defaults to the
+    // upstream hard-coded 170 (GB200); set to the runtime device SM count.
+    int num_sms = 170;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
