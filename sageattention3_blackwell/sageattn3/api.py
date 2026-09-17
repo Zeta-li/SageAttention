@@ -20,8 +20,6 @@ This file additionally carries the SGLang/boogu optimizations:
   * device-adaptive persistent-grid sizing via ``num_sms``
 """
 import torch
-import triton
-import triton.language as tl
 import torch.nn.functional as F
 from typing import Tuple
 from torch.nn.functional import scaled_dot_product_attention as sdpa
@@ -50,59 +48,19 @@ def supports_current_device(device=None) -> bool:
     return (major, minor) in {(10, 0), (12, 0), (12, 1)}
 
 
-@triton.jit
-def group_mean_kernel(
-    q_ptr,
-    q_out_ptr,
-    qm_out_ptr,
-    B, H, L, D: tl.constexpr,
-    stride_qb, stride_qh, stride_ql, stride_qd,
-    stride_qmb, stride_qmh, stride_qml, stride_qmd,
-    GROUP_SIZE: tl.constexpr,
-    D_POW2: tl.constexpr
-):
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_group = tl.program_id(2)
-    
-    group_start = pid_group * GROUP_SIZE
-    offsets = group_start + tl.arange(0, GROUP_SIZE)
-    # Masked feature range supports non-power-of-2 head dims (e.g. 120).
-    d_range = tl.arange(0, D_POW2)
-    d_mask = d_range < D
-    
-    q_offsets = pid_b * stride_qb + pid_h * stride_qh + offsets[:, None] * stride_ql + d_range[None, :] * stride_qd
-    q_group = tl.load(q_ptr + q_offsets, mask=d_mask[None, :], other=0.0)
-    
-    qm_group = tl.sum(q_group, axis=0) / GROUP_SIZE
-    
-    q_group = q_group - qm_group
-    tl.store(q_out_ptr + q_offsets, q_group, mask=d_mask[None, :])
+def group_mean(q: torch.Tensor):
+    """Per-128-token mean subtraction, torch-native (vectorized reduction).
 
-    qm_offset = pid_b * stride_qmb + pid_h * stride_qmh + pid_group * stride_qml + d_range * stride_qmd
-    tl.store(qm_out_ptr + qm_offset, qm_group, mask=d_mask)
-
-
-def triton_group_mean(q: torch.Tensor):
+    Replaces the old triton kernel: on non-standard head dims (e.g. 120) the
+    masked triton loads were ~10x slower than this path (2.5ms -> 0.36ms at
+    [1,28,18688,120]). Requires L % 128 == 0 (guaranteed by the seq pad in
+    preprocess_qkv when per_block_mean=True).
+    """
     B, H, L, D = q.shape
-    GROUP_SIZE = 128
-    num_groups = L // GROUP_SIZE
-    d_pow2 = max(16, triton.next_power_of_2(D))
-    
-    q_out = torch.empty_like(q)  # [B, H, L, D]
-    qm = torch.empty(B, H, num_groups, D, device=q.device, dtype=q.dtype)
-    
-    grid = (B, H, num_groups)
-    
-    group_mean_kernel[grid](
-        q, q_out, qm,
-        B, H, L, D,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        qm.stride(0), qm.stride(1), qm.stride(2), qm.stride(3),
-        GROUP_SIZE=GROUP_SIZE,
-        D_POW2=d_pow2
-    )
-    return q_out, qm
+    num_groups = L // 128
+    xg = q.view(B, H, num_groups, 128, D)
+    qm = xg.mean(dim=3)
+    return (xg - qm.unsqueeze(3)).view(B, H, L, D), qm
 
 
 def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True, pad_seq: bool = None):
@@ -114,8 +72,8 @@ def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_
             return x.contiguous()
         return F.pad(x, (0, 0, 0, pad_len), value=0).contiguous()
 
-    # Sequence padding is only needed by the per-block-mean path (the triton
-    # group-mean kernel requires L % 128 == 0). The attention kernel itself
+    # Sequence padding is only needed by the per-block-mean path (the group-mean
+    # reduction requires L % 128 == 0). The attention kernel itself
     # handles ragged sequence tails via the unpadded_k interface, and the
     # quantization kernels already predicate their token loop, so the
     # per_block_mean=False path skips the three full-tensor F.pad passes.
@@ -128,7 +86,7 @@ def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_
     if pad_seq:
         q, k, v = map(lambda x: pad_128(x), [q, k, v])
     if per_block_mean:
-        q, qm = triton_group_mean(q)
+        q, qm = group_mean(q)
     else:
         qm = q.mean(dim=-2, keepdim=True)
         q = q - qm
